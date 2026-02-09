@@ -42,6 +42,7 @@ androidx-compose-foundation-layout = { group = "androidx.compose.foundation", na
 androidx-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "material3" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 android-pdf-viewer = { module = "com.github.mhiew:android-pdf-viewer", version.ref = "androidPdfViewer" }
+androidx-media = { module = "androidx.media:media", version = "1.7.0" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

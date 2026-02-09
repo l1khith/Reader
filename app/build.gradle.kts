@@ -65,4 +65,6 @@ dependencies {
 
     implementation(libs.gson)
     implementation(libs.android.pdf.viewer)
+
+    implementation(libs.androidx.media)
 }

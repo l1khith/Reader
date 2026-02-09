@@ -1,12 +1,14 @@
 package com.example.ineedtoknown
 
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.net.Uri
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.os.IBinder
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,15 +35,14 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -65,7 +66,6 @@ import com.example.ineedtoknown.ui.theme.TextWhite
 import com.github.barteksc.pdfviewer.PDFView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.Locale
 
 @Composable
 fun ToggleButton(text: String, isSelected: Boolean, onClick: () -> Unit) {
@@ -76,18 +76,10 @@ fun ToggleButton(text: String, isSelected: Boolean, onClick: () -> Unit) {
         modifier = Modifier
             .clip(RoundedCornerShape(6.dp))
             .background(backgroundColor)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null
-            ) { onClick() }
+            .clickable { onClick() }
             .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
-        Text(
-            text = text,
-            color = textColor,
-            fontSize = 13.sp,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-        )
+        Text(text, color = textColor, fontSize = 13.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
     }
 }
 
@@ -100,101 +92,85 @@ fun ReaderScreen(
 ) {
     val context = LocalContext.current
 
+    // --- SERVICE CONNECTION ---
+    var readerService by remember { mutableStateOf<ReaderService?>(null) }
+    var isBound by remember { mutableStateOf(false) }
+
+    val connection = remember {
+        object : ServiceConnection {
+            override fun onServiceConnected(className: ComponentName, service: IBinder) {
+                val binder = service as ReaderService.LocalBinder
+                readerService = binder.getService()
+                isBound = true
+            }
+            override fun onServiceDisconnected(arg0: ComponentName) {
+                isBound = false
+                readerService = null
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        val intent = Intent(context, ReaderService::class.java)
+        context.startService(intent)
+        context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        onDispose {
+            if (isBound) {
+                context.unbindService(connection)
+                isBound = false
+            }
+        }
+    }
+
     // --- STATES ---
-    var currentPage by remember { mutableIntStateOf(0) }
+
+    // 1. FIX: Load Saved Page IMMEDIATELY (Before creating state)
+    val initialPage = remember {
+        val savedBooks = BookStore.getAllBooks(context)
+        savedBooks.find { it.uriString == uri.toString() }?.currentPage ?: 0
+    }
+
+    var currentPage by remember { mutableIntStateOf(initialPage) }
     var sentences by remember { mutableStateOf<List<String>>(emptyList()) }
-    var currentSentenceIndex by remember { mutableIntStateOf(0) }
-
-    var isVisualMode by remember { mutableStateOf(true) }
-    var isPlaying by remember { mutableStateOf(false) }
     var totalPages by remember { mutableIntStateOf(1) }
+    var isVisualMode by remember { mutableStateOf(true) }
 
-    // NEW: Playback Speed Control
+    // Speed Control State
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+
+    // OBSERVE SERVICE STATE
+    val currentSentenceIndex by readerService?.currentSentenceIndexFlow?.collectAsState(initial = 0) ?: remember { mutableIntStateOf(0) }
+    val isPlaying by readerService?.isPlayingFlow?.collectAsState(initial = false) ?: remember { mutableStateOf(false) }
 
     val textListState = rememberLazyListState()
 
-    // --- TTS SETUP ---
-    var tts: TextToSpeech? by remember { mutableStateOf(null) }
-    var isTtsReady by remember { mutableStateOf(false) }
-
-    DisposableEffect(Unit) {
-        tts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = Locale.US
-
-                // NEW: Try to find a "High Quality" voice automatically
-                val availableVoices = tts?.voices
-                val bestVoice = availableVoices?.find {
-                    it.name.contains("high", ignoreCase = true) && !it.name.contains("network", ignoreCase = true)
-                } ?: tts?.defaultVoice
-
-                if (bestVoice != null) {
-                    tts?.voice = bestVoice
-                }
-
-                isTtsReady = true
-
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {}
-                    override fun onDone(utteranceId: String?) {
-                        currentSentenceIndex++
-                    }
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {}
-                })
-            }
-        }
-        onDispose {
-            tts?.stop()
-            tts?.shutdown()
-        }
+    // --- SYNC SPEED TO SERVICE ---
+    LaunchedEffect(playbackSpeed, readerService) {
+        readerService?.setSpeed(playbackSpeed)
     }
 
-    // NEW: Update Speed whenever variable changes
-    LaunchedEffect(playbackSpeed, isTtsReady) {
-        if (isTtsReady) {
-            tts?.setSpeechRate(playbackSpeed)
-        }
-    }
+    // --- SYNC PAGE CONTENT ---
+    LaunchedEffect(currentPage, uri, isBound) {
+        if (!isBound) return@LaunchedEffect
 
-    // --- AUDIO PLAYER LOGIC ---
-    LaunchedEffect(isPlaying, currentSentenceIndex, isTtsReady, sentences, playbackSpeed) { // Added playbackSpeed to key
-        if (isTtsReady && isPlaying) {
-            if (sentences.isNotEmpty()) {
-                if (currentSentenceIndex < sentences.size) {
-                    tts?.setSpeechRate(playbackSpeed) // Ensure speed is set before speaking
-                    tts?.speak(sentences[currentSentenceIndex], TextToSpeech.QUEUE_FLUSH, null, "id_$currentSentenceIndex")
-
-                    if (!isVisualMode) {
-                        textListState.animateScrollToItem(currentSentenceIndex)
-                    }
-                } else {
-                    // Auto Page Turn
-                    if (currentPage < totalPages - 1) {
-                        currentPage++
-                    } else {
-                        isPlaying = false
-                        currentSentenceIndex = 0
-                    }
-                }
-            }
-        } else {
-            tts?.stop()
-        }
-    }
-
-    // --- SYNC LOGIC (Page Turns) ---
-    LaunchedEffect(currentPage, uri) {
-        currentSentenceIndex = 0
+        // Save progress
         val fileName = FileNameUtils.getFileName(context, uri)
         BookStore.saveBookProgress(context, uri, currentPage, totalPages, fileName)
 
+        // Extract Text
         withContext(Dispatchers.IO) {
             val extractedSentences = pdfHelper.extractTextFromPage(context, uri, currentPage)
             withContext(Dispatchers.Main) {
                 sentences = extractedSentences
+                readerService?.setSentences(extractedSentences)
             }
+        }
+    }
+
+    // Auto-Scroll Logic
+    LaunchedEffect(currentSentenceIndex) {
+        if (!isVisualMode && sentences.isNotEmpty()) {
+            textListState.animateScrollToItem(currentSentenceIndex)
         }
     }
 
@@ -233,84 +209,54 @@ fun ReaderScreen(
                             }
                             .enableSwipe(true)
                             .swipeHorizontal(false)
-                            .enableDoubletap(true)
                             .spacing(10)
                             .load()
                     }
                 )
             } else {
-                if (sentences.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.75f), contentAlignment = Alignment.Center) {
-                        Text("Loading text...", color = TextGrey)
-                    }
-                } else {
-                    LazyColumn(
-                        state = textListState,
-                        modifier = Modifier.fillMaxWidth().fillMaxHeight(0.75f).padding(horizontal = 16.dp)
-                    ) {
-                        itemsIndexed(sentences) { index, sentence ->
-                            val isActive = index == currentSentenceIndex
-                            val itemColor = if (isActive) AccentBlue else TextWhite
-                            val bgColor = if (isActive) SurfaceDark else Color.Transparent
-                            val weight = if (isActive) FontWeight.Bold else FontWeight.Normal
+                LazyColumn(
+                    state = textListState,
+                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.75f).padding(horizontal = 16.dp)
+                ) {
+                    itemsIndexed(sentences) { index, sentence ->
+                        val isActive = index == currentSentenceIndex
+                        val itemColor = if (isActive) AccentBlue else TextWhite
+                        val bgColor = if (isActive) SurfaceDark else Color.Transparent
+                        val weight = if (isActive) FontWeight.Bold else FontWeight.Normal
 
-                            Text(
-                                text = sentence,
-                                color = itemColor,
-                                fontSize = 18.sp,
-                                lineHeight = 28.sp,
-                                fontWeight = weight,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(bgColor)
-                                    .clickable {
-                                        currentSentenceIndex = index
-                                        isPlaying = true
-                                    }
-                                    .padding(12.dp)
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                        }
+                        Text(
+                            text = sentence,
+                            color = itemColor,
+                            fontSize = 18.sp,
+                            fontWeight = weight,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(bgColor)
+                                .clickable { readerService?.playSentence(index) }
+                                .padding(12.dp)
+                        )
                     }
                 }
             }
 
             // --- BOTTOM CONTROLS ---
             Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(SurfaceDark, RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
-                    .padding(24.dp)
+                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(SurfaceDark).padding(24.dp)
             ) {
-                // Navigation
-                Row(
-                    modifier = Modifier.fillMaxWidth().background(AppBackground, RoundedCornerShape(12.dp)).padding(8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    FilledTonalIconButton(
-                        onClick = { if (currentPage > 0) currentPage-- },
-                        colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = SurfaceDark, contentColor = TextWhite)
-                    ) { Icon(Icons.Default.Remove, "Prev") }
-
-                    Text("${currentPage + 1} / $totalPages", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-
-                    FilledTonalIconButton(
-                        onClick = { if (currentPage < totalPages - 1) currentPage++ },
-                        colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = AccentBlue, contentColor = Color.White)
-                    ) { Icon(Icons.Default.Add, "Next") }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    FilledTonalIconButton(onClick = { if (currentPage > 0) currentPage-- }) {
+                        Icon(Icons.Default.Remove, "Prev")
+                    }
+                    Text("${currentPage + 1} / $totalPages", color = TextWhite)
+                    FilledTonalIconButton(onClick = { if (currentPage < totalPages - 1) currentPage++ }) {
+                        Icon(Icons.Default.Add, "Next")
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(24.dp))
 
-                // Player Controls
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Row(
                         modifier = Modifier.background(Color(0xFF2D2D3A), RoundedCornerShape(8.dp)).padding(4.dp)
                     ) {
@@ -318,34 +264,24 @@ fun ReaderScreen(
                         ToggleButton(text = "Text", isSelected = !isVisualMode) { isVisualMode = false }
                     }
 
-                    // Play Button
                     Box(
                         modifier = Modifier
                             .size(56.dp)
-                            .background(if (isTtsReady) AccentBlue else Color.Gray, CircleShape)
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = ripple()
-                            ) {
-                                if (isTtsReady) isPlaying = !isPlaying
-                                else Toast.makeText(context, "TTS Loading...", Toast.LENGTH_SHORT).show()
+                            .background(AccentBlue, CircleShape)
+                            .clickable {
+                                if (isPlaying) readerService?.pauseAudio()
+                                else readerService?.resumeAudio()
                             },
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            "Play",
-                            tint = Color.White,
-                            modifier = Modifier.size(32.dp)
-                        )
+                        Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, "Play", tint = Color.White)
                     }
 
-                    // NEW: Speed Button Logic
+                    // Speed Button (Re-added)
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
                             .clickable {
-                                // Cycle speeds: 1.0 -> 1.5 -> 2.0 -> 0.8 -> 1.0
                                 playbackSpeed = when (playbackSpeed) {
                                     1.0f -> 1.5f
                                     1.5f -> 2.0f
