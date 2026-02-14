@@ -34,6 +34,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
     private val _isPlayingFlow = MutableStateFlow(false)
     val isPlayingFlow: StateFlow<Boolean> = _isPlayingFlow
 
+    // --- NEW: Callback for Page Turn ---
+    var onPageEndReached: (() -> Unit)? = null
+
     private lateinit var mediaSession: MediaSessionCompat
 
     override fun onCreate() {
@@ -54,21 +57,19 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
             isActive = true
         }
     }
+
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             val result = tts?.setLanguage(Locale.US)
 
+            // SMART VOICE HUNTER
             if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
                 val voices = tts?.voices
                 if (voices != null) {
-                    // HUNTER: Prioritize Female Voices (Voice I, Voice IV)
-                    // "tpf" = Voice I (Female)
-                    // "sfg" = Voice IV (Female High Quality)
-                    // "female" = Generic keyword
                     val bestVoice = voices.find { it.name.contains("en-us-x-sfg", ignoreCase = true) } // Voice IV (Best Female)
-                        ?: voices.find { it.name.contains("en-us-x-tpf", ignoreCase = true) } // Voice I (Std Female)
-                        ?: voices.find { it.name.contains("female", ignoreCase = true) } // Generic Female
-                        ?: voices.find { it.name.contains("high", ignoreCase = true) } // Fallback to High Quality
+                        ?: voices.find { it.name.contains("en-us-x-tpf", ignoreCase = true) }
+                        ?: voices.find { it.name.contains("high", ignoreCase = true) }
+                        ?: voices.find { it.name.contains("enhanced", ignoreCase = true) }
                         ?: tts?.defaultVoice
 
                     if (bestVoice != null) tts?.voice = bestVoice
@@ -78,17 +79,24 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // --- NEW: SPEED CONTROL ---
+    // SPEED CONTROL
     fun setSpeed(speed: Float) {
         if (isTtsReady) {
             tts?.setSpeechRate(speed)
         }
     }
 
+    // --- UPDATED: Handle Auto-Play for New Pages ---
     fun setSentences(newSentences: List<String>) {
         sentences = newSentences
         currentSentenceIndex = 0
         _currentSentenceIndexFlow.value = 0
+
+        // IMPORTANT: If we are currently "Playing" (even if waiting for page turn),
+        // start reading the new page immediately.
+        if (_isPlayingFlow.value && sentences.isNotEmpty()) {
+            playSentence(0)
+        }
     }
 
     fun playSentence(index: Int) {
@@ -126,11 +134,17 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         playSentence(currentSentenceIndex)
     }
 
+    // --- UPDATED: Trigger Page Turn Logic ---
     private fun nextSentence() {
         if (currentSentenceIndex < sentences.size - 1) {
             playSentence(currentSentenceIndex + 1)
         } else {
-            pauseAudio()
+            // End of Page Reached.
+            // Do NOT pause. We want to keep 'isPlaying' true so the next page starts.
+            // Notify the UI to flip the page.
+            CoroutineScope(Dispatchers.Main).launch {
+                onPageEndReached?.invoke()
+            }
         }
     }
 

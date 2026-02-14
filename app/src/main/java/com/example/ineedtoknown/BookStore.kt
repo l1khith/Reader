@@ -59,6 +59,16 @@ object BookStore {
         val list: List<BookData> = gson.fromJson(json, type)
         return list.sortedByDescending { it.lastReadTimestamp }
     }
+    fun deleteBook(context: Context, uriString: String) {
+        val books = getAllBooks(context).toMutableList()
+        // Remove the book that matches the URI
+        val wasRemoved = books.removeAll { it.uriString == uriString }
+
+        // Save the updated list back to storage
+        if (wasRemoved) {
+            saveList(context, books)
+        }
+    }
 
     private fun saveList(context: Context, list: List<BookData>) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

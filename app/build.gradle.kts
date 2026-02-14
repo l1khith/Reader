@@ -6,7 +6,8 @@ plugins {
 
 android {
     namespace = "com.example.ineedtoknown"
-    compileSdk =35
+    compileSdk = 35
+
     defaultConfig {
         applicationId = "com.example.ineedtoknown"
         minSdk = 26
@@ -36,6 +37,11 @@ android {
     buildFeatures {
         compose = true
     }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
 }
 
 dependencies {
@@ -59,7 +65,7 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 
     implementation(libs.androidx.navigation.compose)
-    implementation(libs.coil.compose) // For loading cover images
+    implementation(libs.coil.compose)
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.pdfbox.android)
 

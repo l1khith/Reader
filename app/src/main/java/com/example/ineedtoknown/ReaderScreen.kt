@@ -124,7 +124,7 @@ fun ReaderScreen(
 
     // --- STATES ---
 
-    // 1. FIX: Load Saved Page IMMEDIATELY (Before creating state)
+    // 1. FIX: Load Saved Page IMMEDIATELY
     val initialPage = remember {
         val savedBooks = BookStore.getAllBooks(context)
         savedBooks.find { it.uriString == uri.toString() }?.currentPage ?: 0
@@ -149,6 +149,18 @@ fun ReaderScreen(
         readerService?.setSpeed(playbackSpeed)
     }
 
+    // --- NEW: LISTEN FOR PAGE END (Continuous Reading) ---
+    // This updates the callback whenever dependencies change
+    LaunchedEffect(readerService, totalPages, currentPage) {
+        readerService?.onPageEndReached = {
+            if (currentPage < totalPages - 1) {
+                currentPage++ // This triggers the page load below
+            } else {
+                readerService?.pauseAudio() // End of book
+            }
+        }
+    }
+
     // --- SYNC PAGE CONTENT ---
     LaunchedEffect(currentPage, uri, isBound) {
         if (!isBound) return@LaunchedEffect
@@ -162,6 +174,7 @@ fun ReaderScreen(
             val extractedSentences = pdfHelper.extractTextFromPage(context, uri, currentPage)
             withContext(Dispatchers.Main) {
                 sentences = extractedSentences
+                // Send text to service. Service will AUTO-PLAY if isPlaying is true.
                 readerService?.setSentences(extractedSentences)
             }
         }
@@ -277,7 +290,7 @@ fun ReaderScreen(
                         Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, "Play", tint = Color.White)
                     }
 
-                    // Speed Button (Re-added)
+                    // Speed Button
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))

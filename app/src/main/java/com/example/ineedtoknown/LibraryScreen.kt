@@ -1,9 +1,9 @@
 package com.example.ineedtoknown
 
 import android.net.Uri
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,14 +26,17 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
-import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -61,23 +64,53 @@ fun LibraryScreen(
     onAddBookClick: () -> Unit
 ) {
     val context = LocalContext.current
-    // 1. Load Real Data
     var allBooks by remember { mutableStateOf(BookStore.getAllBooks(context)) }
     var searchQuery by remember { mutableStateOf("") }
 
-    // Refresh data when screen appears (in case you just came back from reading)
+    // --- DELETE DIALOG STATE ---
+    var bookToDelete by remember { mutableStateOf<BookData?>(null) }
+
     LaunchedEffect(Unit) {
         allBooks = BookStore.getAllBooks(context)
     }
 
-    // 2. Search Logic
     val filteredBooks = remember(allBooks, searchQuery) {
         if (searchQuery.isBlank()) allBooks
         else allBooks.filter { it.title.contains(searchQuery, ignoreCase = true) }
     }
 
-    // 3. Find "Continue Reading" (Most recent book)
     val recentBook = allBooks.firstOrNull()
+
+    // --- DELETE CONFIRMATION DIALOG ---
+    if (bookToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { bookToDelete = null },
+            title = { Text("Delete Book?", color = TextWhite) },
+            text = { Text("Are you sure you want to remove '${bookToDelete?.title}' from your library?", color = TextGrey) },
+            containerColor = SurfaceDark,
+            confirmButton = {
+                Button(
+                    onClick = {
+                        bookToDelete?.let { book ->
+                            // 1. Delete from Store
+                            BookStore.deleteBook(context, book.uriString)
+                            // 2. Refresh List
+                            allBooks = BookStore.getAllBooks(context)
+                        }
+                        bookToDelete = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                ) {
+                    Text("Delete", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { bookToDelete = null }) {
+                    Text("Cancel", color = TextWhite)
+                }
+            }
+        )
+    }
 
     Scaffold(
         containerColor = AppBackground,
@@ -110,7 +143,7 @@ fun LibraryScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Real Search Bar
+            // Search Bar
             TextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
@@ -130,13 +163,14 @@ fun LibraryScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Continue Reading (Only show if we have history)
+            // Continue Reading
             if (recentBook != null) {
                 Text("Continue Reading", color = TextWhite, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 Spacer(modifier = Modifier.height(12.dp))
                 ContinueReadingCard(
                     book = recentBook,
-                    onClick = { onBookClick(recentBook.uriString.toUri()) }
+                    onClick = { onBookClick(recentBook.uriString.toUri()) },
+                    onLongClick = { bookToDelete = recentBook } // Enable Delete here too
                 )
                 Spacer(modifier = Modifier.height(24.dp))
             }
@@ -164,7 +198,8 @@ fun LibraryScreen(
                     items(filteredBooks) { book ->
                         BookGridItem(
                             book = book,
-                            onClick = { onBookClick(book.uriString.toUri()) }
+                            onClick = { onBookClick(book.uriString.toUri()) },
+                            onLongClick = { bookToDelete = book } // Pass delete trigger
                         )
                     }
                 }
@@ -173,17 +208,17 @@ fun LibraryScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun BookGridItem(book: BookData, onClick: () -> Unit) {
+fun BookGridItem(book: BookData, onClick: () -> Unit, onLongClick: () -> Unit) {
     Column(
         modifier = Modifier
             .width(160.dp)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = ripple()
-            ) { onClick() }
+            .combinedClickable( // Allows Long Press
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
     ) {
-        // Placeholder Cover
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -202,7 +237,6 @@ fun BookGridItem(book: BookData, onClick: () -> Unit) {
             maxLines = 2,
             overflow = TextOverflow.Ellipsis
         )
-        // Real Progress Calculation
         val progressPercent = (book.getProgress() * 100).toInt()
         Text(
             text = "${progressPercent}% Read",
@@ -212,17 +246,18 @@ fun BookGridItem(book: BookData, onClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun ContinueReadingCard(book: BookData, onClick: () -> Unit) {
+fun ContinueReadingCard(book: BookData, onClick: () -> Unit, onLongClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .height(140.dp)
             .background(SurfaceDark, RoundedCornerShape(16.dp))
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = ripple()
-            ) { onClick() }
+            .combinedClickable( // Allows Long Press
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
