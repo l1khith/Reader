@@ -2,14 +2,15 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
 }
 
 android {
-    namespace = "com.example.ineedtoknown"
+    namespace = "com.example.reader"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.ineedtoknown"
+        applicationId = "com.example.reader"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
@@ -73,4 +74,9 @@ dependencies {
     implementation(libs.android.pdf.viewer)
 
     implementation(libs.androidx.media)
+
+    // Room Database
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
 }

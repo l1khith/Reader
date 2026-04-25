@@ -1,4 +1,4 @@
-package com.example.ineedtoknown
+package com.example.reader
 
 import android.content.Intent
 import android.net.Uri
@@ -14,7 +14,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
-import com.example.ineedtoknown.ui.theme.IneedtoknownTheme // Make sure this matches your Theme name
+import com.example.reader.ui.theme.ReaderTheme
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 
 class MainActivity : ComponentActivity() {
@@ -25,7 +25,7 @@ class MainActivity : ComponentActivity() {
         PDFBoxResourceLoader.init(applicationContext)
 
         setContent {
-            IneedtoknownTheme {
+            ReaderTheme {
                 AppNavigation()
             }
         }

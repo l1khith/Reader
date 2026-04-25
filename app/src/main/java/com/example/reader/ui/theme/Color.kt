@@ -1,4 +1,4 @@
-package com.example.ineedtoknown.ui.theme
+package com.example.reader.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

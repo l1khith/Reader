@@ -1,4 +1,4 @@
-package com.example.ineedtoknown
+package com.example.reader
 
 import android.net.Uri
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -38,7 +38,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,11 +52,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.net.toUri
-import com.example.ineedtoknown.ui.theme.AccentBlue
-import com.example.ineedtoknown.ui.theme.AppBackground
-import com.example.ineedtoknown.ui.theme.SurfaceDark
-import com.example.ineedtoknown.ui.theme.TextGrey
-import com.example.ineedtoknown.ui.theme.TextWhite
+import com.example.reader.ui.theme.AccentBlue
+import com.example.reader.ui.theme.AppBackground
+import com.example.reader.ui.theme.SurfaceDark
+import com.example.reader.ui.theme.TextGrey
+import com.example.reader.ui.theme.TextWhite
 
 @Composable
 fun LibraryScreen(
@@ -64,15 +64,13 @@ fun LibraryScreen(
     onAddBookClick: () -> Unit
 ) {
     val context = LocalContext.current
-    var allBooks by remember { mutableStateOf(BookStore.getAllBooks(context)) }
+
+    // Issue #4 fix: Collect the Flow — library updates automatically when the DB changes.
+    val allBooks by BookStore.getAllBooksFlow(context).collectAsState(initial = emptyList())
     var searchQuery by remember { mutableStateOf("") }
 
-    // --- DELETE DIALOG STATE ---
+    // DELETE DIALOG STATE
     var bookToDelete by remember { mutableStateOf<BookData?>(null) }
-
-    LaunchedEffect(Unit) {
-        allBooks = BookStore.getAllBooks(context)
-    }
 
     val filteredBooks = remember(allBooks, searchQuery) {
         if (searchQuery.isBlank()) allBooks
@@ -81,7 +79,7 @@ fun LibraryScreen(
 
     val recentBook = allBooks.firstOrNull()
 
-    // --- DELETE CONFIRMATION DIALOG ---
+    // DELETE CONFIRMATION DIALOG
     if (bookToDelete != null) {
         AlertDialog(
             onDismissRequest = { bookToDelete = null },
@@ -92,10 +90,7 @@ fun LibraryScreen(
                 Button(
                     onClick = {
                         bookToDelete?.let { book ->
-                            // 1. Delete from Store
                             BookStore.deleteBook(context, book.uriString)
-                            // 2. Refresh List
-                            allBooks = BookStore.getAllBooks(context)
                         }
                         bookToDelete = null
                     },
@@ -170,7 +165,7 @@ fun LibraryScreen(
                 ContinueReadingCard(
                     book = recentBook,
                     onClick = { onBookClick(recentBook.uriString.toUri()) },
-                    onLongClick = { bookToDelete = recentBook } // Enable Delete here too
+                    onLongClick = { bookToDelete = recentBook }
                 )
                 Spacer(modifier = Modifier.height(24.dp))
             }
@@ -199,7 +194,7 @@ fun LibraryScreen(
                         BookGridItem(
                             book = book,
                             onClick = { onBookClick(book.uriString.toUri()) },
-                            onLongClick = { bookToDelete = book } // Pass delete trigger
+                            onLongClick = { bookToDelete = book }
                         )
                     }
                 }
@@ -214,7 +209,7 @@ fun BookGridItem(book: BookData, onClick: () -> Unit, onLongClick: () -> Unit) {
     Column(
         modifier = Modifier
             .width(160.dp)
-            .combinedClickable( // Allows Long Press
+            .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick
             )
@@ -254,7 +249,7 @@ fun ContinueReadingCard(book: BookData, onClick: () -> Unit, onLongClick: () -> 
             .fillMaxWidth()
             .height(140.dp)
             .background(SurfaceDark, RoundedCornerShape(16.dp))
-            .combinedClickable( // Allows Long Press
+            .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick
             )

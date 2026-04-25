@@ -1,4 +1,4 @@
-package com.example.ineedtoknown
+package com.example.reader
 
 import android.content.ComponentName
 import android.content.Context
@@ -58,11 +58,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.example.ineedtoknown.ui.theme.AccentBlue
-import com.example.ineedtoknown.ui.theme.AppBackground
-import com.example.ineedtoknown.ui.theme.SurfaceDark
-import com.example.ineedtoknown.ui.theme.TextGrey
-import com.example.ineedtoknown.ui.theme.TextWhite
+import com.example.reader.ui.theme.AccentBlue
+import com.example.reader.ui.theme.AppBackground
+import com.example.reader.ui.theme.SurfaceDark
+import com.example.reader.ui.theme.TextGrey
+import com.example.reader.ui.theme.TextWhite
 import com.github.barteksc.pdfviewer.PDFView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -92,9 +92,14 @@ fun ReaderScreen(
 ) {
     val context = LocalContext.current
 
-    // --- SERVICE CONNECTION ---
+    // ─────────────────────────────────────────────────────────────────────────
+    // SERVICE CONNECTION
+    // ─────────────────────────────────────────────────────────────────────────
+
     var readerService by remember { mutableStateOf<ReaderService?>(null) }
     var isBound by remember { mutableStateOf(false) }
+
+    val serviceIntent = remember { Intent(context, ReaderService::class.java) }
 
     val connection = remember {
         object : ServiceConnection {
@@ -110,32 +115,56 @@ fun ReaderScreen(
         }
     }
 
-    DisposableEffect(Unit) {
-        val intent = Intent(context, ReaderService::class.java)
-        context.startService(intent)
-        context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    // ─────────────────────────────────────────────────────────────────────────
+    // SERVICE + PDF LIFECYCLE (Issues #2, #5, #6)
+    //
+    // We open both the PDDocument and PdfRenderer once here, and clean them up
+    // in onDispose. We also stop the service if the user exits while paused
+    // (Issue #5) to prevent the service from lingering indefinitely.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    DisposableEffect(uri) {
+        // Open PDF resources (Issues #2 and #6)
+        pdfHelper.openDocument(context, uri)
+        pdfHelper.openRenderer(context, uri)
+
+        // Start and bind service
+        context.startService(serviceIntent)
+        context.bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+
         onDispose {
+            // Unbind service
             if (isBound) {
                 context.unbindService(connection)
-                isBound = false
             }
+
+            // Issue #5 fix: If the user backs out while paused (or never started playing),
+            // explicitly stop the started service so it doesn't linger.
+            val isCurrentlyPlaying = readerService?.isPlayingFlow?.value ?: false
+            if (!isCurrentlyPlaying) {
+                context.stopService(serviceIntent)
+            }
+
+            // Release PDF resources (Issues #2 and #6)
+            pdfHelper.closeDocument()
+            pdfHelper.closeRenderer()
         }
     }
 
-    // --- STATES ---
+    // ─────────────────────────────────────────────────────────────────────────
+    // STATES
+    // ─────────────────────────────────────────────────────────────────────────
 
-    // 1. FIX: Load Saved Page IMMEDIATELY
     val initialPage = remember {
-        val savedBooks = BookStore.getAllBooks(context)
-        savedBooks.find { it.uriString == uri.toString() }?.currentPage ?: 0
+        val savedBooks = BookStore.getAllBooksFlow(context)
+        // Can't suspend here; use page 0 as default, the LaunchedEffect below will restore
+        0
     }
 
     var currentPage by remember { mutableIntStateOf(initialPage) }
     var sentences by remember { mutableStateOf<List<String>>(emptyList()) }
     var totalPages by remember { mutableIntStateOf(1) }
     var isVisualMode by remember { mutableStateOf(true) }
-
-    // Speed Control State
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
     // OBSERVE SERVICE STATE
@@ -144,48 +173,62 @@ fun ReaderScreen(
 
     val textListState = rememberLazyListState()
 
-    // --- SYNC SPEED TO SERVICE ---
+    // Restore saved page on first bind
+    LaunchedEffect(isBound) {
+        if (isBound) {
+            withContext(Dispatchers.IO) {
+                val saved = BookStore.getBook(context, uri.toString())
+                withContext(Dispatchers.Main) {
+                    if (saved != null) currentPage = saved.currentPage
+                }
+            }
+        }
+    }
+
+    // Sync speed to service
     LaunchedEffect(playbackSpeed, readerService) {
         readerService?.setSpeed(playbackSpeed)
     }
 
-    // --- NEW: LISTEN FOR PAGE END (Continuous Reading) ---
-    // This updates the callback whenever dependencies change
+    // Listen for page end (continuous reading)
     LaunchedEffect(readerService, totalPages, currentPage) {
         readerService?.onPageEndReached = {
             if (currentPage < totalPages - 1) {
-                currentPage++ // This triggers the page load below
+                currentPage++
             } else {
                 readerService?.pauseAudio() // End of book
             }
         }
     }
 
-    // --- SYNC PAGE CONTENT ---
+    // Sync page content & save progress
     LaunchedEffect(currentPage, uri, isBound) {
         if (!isBound) return@LaunchedEffect
 
-        // Save progress
+        // Save progress (now async O(1) via Room — Issue #4)
         val fileName = FileNameUtils.getFileName(context, uri)
         BookStore.saveBookProgress(context, uri, currentPage, totalPages, fileName)
 
-        // Extract Text
+        // Extract text using cached PDDocument (Issue #2)
         withContext(Dispatchers.IO) {
             val extractedSentences = pdfHelper.extractTextFromPage(context, uri, currentPage)
             withContext(Dispatchers.Main) {
                 sentences = extractedSentences
-                // Send text to service. Service will AUTO-PLAY if isPlaying is true.
                 readerService?.setSentences(extractedSentences)
             }
         }
     }
 
-    // Auto-Scroll Logic
+    // Auto-scroll sentence in text mode
     LaunchedEffect(currentSentenceIndex) {
         if (!isVisualMode && sentences.isNotEmpty()) {
             textListState.animateScrollToItem(currentSentenceIndex)
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // UI
+    // ─────────────────────────────────────────────────────────────────────────
 
     Scaffold(
         containerColor = AppBackground,
@@ -208,7 +251,7 @@ fun ReaderScreen(
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
 
-            // --- MAIN CONTENT ---
+            // MAIN CONTENT
             if (isVisualMode) {
                 AndroidView(
                     factory = { ctx -> PDFView(ctx, null) },
@@ -253,7 +296,7 @@ fun ReaderScreen(
                 }
             }
 
-            // --- BOTTOM CONTROLS ---
+            // BOTTOM CONTROLS
             Column(
                 modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(SurfaceDark).padding(24.dp)
             ) {
