@@ -17,6 +17,14 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Limit ABIs to what bblanchon/pdfium-binaries provides
+        externalNativeBuild {
+            cmake {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+                arguments += listOf("-DANDROID_STL=c++_shared")
+            }
+        }
     }
 
     buildTypes {
@@ -41,6 +49,13 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = false
+        }
+    }
+    // NDK + Pdfium JNI bridge
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 }
@@ -68,10 +83,10 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.coil.compose)
     implementation(libs.androidx.compose.material.icons.extended)
-    implementation(libs.pdfbox.android)
-
+    // PDFBox and android-pdf-viewer removed — replaced by Pdfium NDK (NativePdfEngine / PdfHelper)
+    // implementation(libs.pdfbox.android)
+    // implementation(libs.android.pdf.viewer)
     implementation(libs.gson)
-    implementation(libs.android.pdf.viewer)
 
     implementation(libs.androidx.media)
 

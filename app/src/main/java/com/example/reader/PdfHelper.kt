@@ -2,220 +2,219 @@ package com.example.reader
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.pdf.PdfRenderer
 import android.net.Uri
-import android.os.ParcelFileDescriptor
+import android.util.DisplayMetrics
 import android.util.Log
-import androidx.core.graphics.createBitmap
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
-import java.io.IOException
+import android.view.WindowManager
 
 /**
- * PdfHelper: A Singleton object responsible for all low-level PDF operations.
+ * PdfHelper — stateful singleton wrapper around [NativePdfEngine] (Pdfium JNI).
  *
- * ARCHITECTURE FIXES:
- * — Issue #2 (PDF Parsing Bottleneck): [cachedDocument] is opened once per session via [openDocument]
- *   and reused across all [extractTextFromPage] calls. Closed via [closeDocument] when the user exits.
- * — Issue #6 (PdfRenderer Reallocation): [cachedRenderer] and [cachedDescriptor] are cached via
- *   [openRenderer] and reused across all [renderPageToBitmap] calls. Closed via [closeRenderer].
+ * ARCHITECTURE OVERVIEW
+ * ─────────────────────
+ * This class replaces the old dual-engine design (PDFBox for text + Android
+ * PdfRenderer for visuals) with a single Pdfium C++ engine.
  *
- * Lifecycle management is delegated to [ReaderScreen] via DisposableEffect.
+ * BITMAP POOL
+ * ───────────
+ * The [HorizontalPager] in ReaderScreen keeps at most 3 pages alive at once
+ * (beyondViewportPageCount = 1): page n-1, n, and n+1.
+ *
+ *   Pager window:  [ page n-1 ]  [ page n ]  [ page n+1 ]
+ *   Pool slot:     [  slot 0  ]  [ slot 1 ]  [  slot 2  ]   (pageIndex % 3)
+ *
+ * Three consecutive page indices always map to three DISTINCT slots, so no
+ * Bitmap is ever reused while it is still displayed on-screen.
+ *
+ * [renderPageToBitmap] passes a pool Bitmap directly to the JNI layer, which
+ * renders into its pixel buffer without allocating anything extra in C++ or
+ * Kotlin — eliminating the OOM Bitmap churn of the previous design.
+ *
+ * THREAD SAFETY
+ * ─────────────
+ * All public functions that touch [docPtr] or the pool are @Synchronized.
+ * Pdfium's FPDF_Document is not thread-safe, so we serialize all calls.
  */
 object PdfHelper {
 
     private const val TAG = "PdfHelper"
 
-    // --- Issue #2 fix: Cached PDDocument ---
-    private var cachedDocument: PDDocument? = null
-    private var cachedDocumentUri: Uri? = null
+    // ── Pdfium document handle (0 = closed) ──────────────────────────────
+    private var docPtr: Long = 0L
+    private var cachedUri: Uri? = null
 
-    // --- Issue #6 fix: Cached PdfRenderer ---
-    private var cachedRenderer: PdfRenderer? = null
-    private var cachedDescriptor: ParcelFileDescriptor? = null
-    private var cachedRendererUri: Uri? = null
+    // ── Bitmap pool: exactly 3 slots for the pager's 3-page window ───────
+    private val bitmapPool: Array<Bitmap?> = arrayOfNulls(3)
 
-    /**
-     * Initializes the PDFBox library.
-     * Must be called in MainActivity.onCreate() before any other operations.
-     */
-    fun init(context: Context) {
-        PDFBoxResourceLoader.init(context)
-    }
+    // Target render resolution — derived from the device's real display size.
+    // Set once in openDocument() and reused for the lifetime of the session.
+    private var targetWidth:  Int = 1080
+    private var targetHeight: Int = 1527   // ~A4 aspect ratio default
 
-    // ─────────────────────────────────────────────────────────────
-    // PDDocument lifecycle (Issue #2)
-    // ─────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Document lifecycle
+    // ─────────────────────────────────────────────────────────────────────
 
     /**
-     * Opens the [PDDocument] for the given [uri] and caches it.
-     * Call this when the user enters [ReaderScreen].
-     */
-    fun openDocument(context: Context, uri: Uri) {
-        if (cachedDocumentUri == uri && cachedDocument != null) return // Already open
-        closeDocument() // Close any previously cached document
-        try {
-            context.contentResolver.openInputStream(uri)?.use { inputStream ->
-                cachedDocument = PDDocument.load(inputStream)
-                cachedDocumentUri = uri
-                Log.d(TAG, "PDDocument opened: $uri")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to open PDDocument: ${e.message}")
-        }
-    }
-
-    /**
-     * Closes and releases the cached [PDDocument].
-     * Call this in [ReaderScreen]'s onDispose.
-     */
-    fun closeDocument() {
-        try {
-            cachedDocument?.close()
-        } catch (e: IOException) {
-            Log.e(TAG, "Error closing PDDocument: ${e.message}")
-        } finally {
-            cachedDocument = null
-            cachedDocumentUri = null
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // PdfRenderer lifecycle (Issue #6)
-    // ─────────────────────────────────────────────────────────────
-
-    /**
-     * Opens the native [PdfRenderer] for the given [uri] and caches it.
-     * Call this when the user enters [ReaderScreen].
-     */
-    fun openRenderer(context: Context, uri: Uri) {
-        if (cachedRendererUri == uri && cachedRenderer != null) return // Already open
-        closeRenderer() // Close any previously cached renderer
-        try {
-            val fd = context.contentResolver.openFileDescriptor(uri, "r") ?: return
-            cachedDescriptor = fd
-            cachedRenderer = PdfRenderer(fd)
-            cachedRendererUri = uri
-            Log.d(TAG, "PdfRenderer opened: $uri")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to open PdfRenderer: ${e.message}")
-        }
-    }
-
-    /**
-     * Closes and releases the cached [PdfRenderer] and its [ParcelFileDescriptor].
-     * Call this in [ReaderScreen]'s onDispose.
-     */
-    fun closeRenderer() {
-        try {
-            cachedRenderer?.close()
-            cachedDescriptor?.close()
-        } catch (e: IOException) {
-            Log.e(TAG, "Error closing PdfRenderer: ${e.message}")
-        } finally {
-            cachedRenderer = null
-            cachedDescriptor = null
-            cachedRendererUri = null
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // PDF operations
-    // ─────────────────────────────────────────────────────────────
-
-    /**
-     * EXTRACT TEXT (The "Smart" Mode)
-     * Uses the cached [PDDocument] to strip text from a specific page.
-     * Falls back to opening the document fresh if not cached (defensive fallback).
+     * Opens the PDF at [uri] using Pdfium.
      *
-     * @param pageIndex 0-based index of the page to read.
-     * @return A list of clean, speakable sentences.
+     * Must be called from the IO dispatcher (heavy mmap work inside JNI).
+     * Replaces the old openDocument() + openRenderer() dual-call.
      */
     @Synchronized
-    fun extractTextFromPage(context: Context, uri: Uri, pageIndex: Int): List<String> {
+    fun openDocument(context: Context, uri: Uri) {
+        if (cachedUri == uri && docPtr != 0L) return   // already open
+
+        closeAll()
+        resolveTargetSize(context)
+
         try {
-            // Ensure document is cached; use it if available
-            val document = cachedDocument?.takeIf { cachedDocumentUri == uri }
-                ?: run {
-                    Log.w(TAG, "PDDocument not cached; opening fresh for page $pageIndex")
-                    context.contentResolver.openInputStream(uri)?.use { PDDocument.load(it) }
-                }
-                ?: return listOf("Error: could not open document.")
-
-            val stripper = PDFTextStripper().apply {
-                startPage = pageIndex + 1 // PDFBox is 1-based
-                endPage = pageIndex + 1
-                sortByPosition = true
+            val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: run {
+                Log.e(TAG, "openDocument: contentResolver returned null for $uri")
+                return
             }
+            // Pass the raw int fd to JNI — the C++ layer memory-maps the file,
+            // so the ParcelFileDescriptor can be closed immediately afterward.
+            val rawFd = pfd.fd
+            docPtr = NativePdfEngine.loadDocument(rawFd)
+            pfd.close()   // safe; the mmap outlives the fd
 
-            val fullText = stripper.getText(document)
-
-            return fullText
-                .split(Regex("(?<=[.!?])\\s+"))
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
-
+            if (docPtr == 0L) {
+                Log.e(TAG, "openDocument: Pdfium failed to load $uri")
+                return
+            }
+            cachedUri = uri
+            Log.d(TAG, "openDocument: success — ${NativePdfEngine.getPageCount(docPtr)} pages")
         } catch (e: Exception) {
-            Log.e(TAG, "Error extracting text: ${e.message}")
-            return listOf("Error reading page. Please try another file.")
+            Log.e(TAG, "openDocument: ${e.message}")
         }
     }
 
     /**
-     * RENDER IMAGE (The "Visual" Mode)
-     * Uses the cached [PdfRenderer] to create a high-quality Bitmap of the page.
+     * No-op — kept so [ReaderScreen]'s LaunchedEffect needs no changes.
+     * Pdfium handles both rendering and text extraction in one engine.
+     */
+    fun openRenderer(context: Context, uri: Uri) = Unit
+
+    fun closeDocument() = closeAll()
+    fun closeRenderer() = Unit   // no-op — single engine
+
+    private fun closeAll() {
+        if (docPtr != 0L) {
+            NativePdfEngine.closeDocument(docPtr)
+            docPtr = 0L
+        }
+        cachedUri = null
+        recycleBitmapPool()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Public API  (surface identical to the old PdfHelper — ReaderScreen
+    //              requires zero changes)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /** Returns the total page count, or 0 if no document is open. */
+    @Synchronized
+    fun getPageCount(context: Context, uri: Uri): Int {
+        if (docPtr == 0L) return 0
+        return NativePdfEngine.getPageCount(docPtr)
+    }
+
+    /**
+     * Renders [pageIndex] into a pool Bitmap and returns it.
      *
-     * @return A Bitmap of the page, or null if rendering failed.
+     * Pool slot selection: `pageIndex % 3`.
+     * The pager's 3-page window guarantees no slot conflict — see class KDoc.
+     *
+     * The C++ layer renders directly into the Bitmap's pixel buffer (zero copy).
+     * The returned Bitmap is the pool Bitmap itself; the caller must NOT recycle it.
      */
     @Synchronized
     fun renderPageToBitmap(context: Context, uri: Uri, pageIndex: Int): Bitmap? {
-        val renderer = cachedRenderer?.takeIf { cachedRendererUri == uri }
-            ?: run {
-                Log.w(TAG, "PdfRenderer not cached; opening fresh for page $pageIndex")
-                openRenderer(context, uri)
-                cachedRenderer
-            }
-            ?: return null
+        if (docPtr == 0L) {
+            Log.w(TAG, "renderPageToBitmap: no document open")
+            return null
+        }
 
-        if (pageIndex < 0 || pageIndex >= renderer.pageCount) return null
+        val slot   = pageIndex % 3
+        val bitmap = ensurePoolBitmap(slot)
 
-        var currentPage: PdfRenderer.Page? = null
-        return try {
-            currentPage = renderer.openPage(pageIndex)
-
-            // Render at 2× the PDF's native point size for crisp text on high-DPI screens
-            val scale = 2
-            val bitmapWidth  = currentPage.width  * scale
-            val bitmapHeight = currentPage.height * scale
-            val bitmap = createBitmap(bitmapWidth, bitmapHeight)
-
-            // Fill white: PdfRenderer writes transparent pixels where the PDF background is
-            // unset, which appear black on a dark surface without this.
-            bitmap.eraseColor(android.graphics.Color.WHITE)
-
-            val matrix = android.graphics.Matrix().apply {
-                setScale(scale.toFloat(), scale.toFloat())
-            }
-            currentPage.render(bitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        return if (NativePdfEngine.renderPage(docPtr, pageIndex, bitmap)) {
             bitmap
-        } catch (e: Exception) {
-            Log.e(TAG, "Error rendering page: ${e.message}")
+        } else {
+            Log.e(TAG, "renderPage failed for page $pageIndex")
             null
-        } finally {
-            try { currentPage?.close() } catch (e: IOException) { e.printStackTrace() }
         }
     }
 
     /**
-     * Helper to get total page count from the cached renderer, or opens one fresh.
+     * Extracts text from [pageIndex] via Pdfium and tokenises it into sentences.
+     * Replaces the old PDFBox-based implementation — same return type.
      */
-    fun getPageCount(context: Context, uri: Uri): Int {
-        cachedRenderer?.takeIf { cachedRendererUri == uri }?.let { return it.pageCount }
+    @Synchronized
+    fun extractTextFromPage(context: Context, uri: Uri, pageIndex: Int): List<String> {
+        if (docPtr == 0L) return listOf("Error: document not open.")
         return try {
-            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                PdfRenderer(pfd).use { it.pageCount }
-            } ?: 0
-        } catch (e: Exception) { 0 }
+            val raw = NativePdfEngine.extractText(docPtr, pageIndex)
+            raw.split(Regex("(?<=[.!?])\\s+"))
+               .map    { it.trim() }
+               .filter { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.e(TAG, "extractTextFromPage error: ${e.message}")
+            listOf("Error reading page.")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bitmap pool helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the pool Bitmap at [slot], creating or recreating it if the
+     * dimensions changed (e.g. after an orientation change).
+     */
+    private fun ensurePoolBitmap(slot: Int): Bitmap {
+        val existing = bitmapPool[slot]
+        if (existing != null &&
+            existing.width  == targetWidth &&
+            existing.height == targetHeight &&
+            !existing.isRecycled) {
+            return existing
+        }
+        existing?.recycle()
+        val fresh = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        bitmapPool[slot] = fresh
+        Log.d(TAG, "Pool slot $slot: allocated ${targetWidth}×${targetHeight} bitmap")
+        return fresh
+    }
+
+    private fun recycleBitmapPool() {
+        for (i in bitmapPool.indices) {
+            bitmapPool[i]?.recycle()
+            bitmapPool[i] = null
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Display helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Sets [targetWidth] / [targetHeight] from the device's real display metrics.
+     * Height is capped at 75% of the screen height to match the Pager's
+     * `fillMaxHeight(0.75f)` modifier, avoiding over-allocation.
+     */
+    @Suppress("DEPRECATION")
+    private fun resolveTargetSize(context: Context) {
+        try {
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val dm = DisplayMetrics()
+            wm.defaultDisplay.getRealMetrics(dm)
+            targetWidth  = dm.widthPixels
+            targetHeight = (dm.heightPixels * 0.75f).toInt()
+            Log.d(TAG, "Pool target size: ${targetWidth}×${targetHeight}")
+        } catch (e: Exception) {
+            Log.w(TAG, "resolveTargetSize: using defaults — ${e.message}")
+        }
     }
 }

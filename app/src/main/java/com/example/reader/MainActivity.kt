@@ -15,14 +15,13 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.example.reader.ui.theme.ReaderTheme
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize PDFBox (Critical for text extraction)
-        PDFBoxResourceLoader.init(applicationContext)
+        // Initialize Pdfium C++ library (replaces PDFBox)
+        NativePdfEngine.initEngine()
 
         setContent {
             ReaderTheme {
