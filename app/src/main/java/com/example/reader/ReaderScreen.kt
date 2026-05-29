@@ -57,13 +57,19 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import com.example.reader.ui.theme.AccentBlue
 import com.example.reader.ui.theme.AppBackground
 import com.example.reader.ui.theme.SurfaceDark
 import com.example.reader.ui.theme.TextGrey
 import com.example.reader.ui.theme.TextWhite
-import com.github.barteksc.pdfviewer.PDFView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -123,12 +129,17 @@ fun ReaderScreen(
     // (Issue #5) to prevent the service from lingering indefinitely.
     // ─────────────────────────────────────────────────────────────────────────
 
-    DisposableEffect(uri) {
-        // Open PDF resources (Issues #2 and #6)
-        pdfHelper.openDocument(context, uri)
-        pdfHelper.openRenderer(context, uri)
+    // Open heavy PDF resources on the IO thread so the main thread is never blocked
+    // (PDDocument.load reads the entire PDF structure — can take seconds on large files)
+    LaunchedEffect(uri) {
+        withContext(Dispatchers.IO) {
+            pdfHelper.openDocument(context, uri)
+            pdfHelper.openRenderer(context, uri)
+        }
+    }
 
-        // Start and bind service
+    DisposableEffect(uri) {
+        // Start and bind service (fast — main thread is fine here)
         context.startService(serviceIntent)
         context.bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
 
@@ -138,14 +149,13 @@ fun ReaderScreen(
                 context.unbindService(connection)
             }
 
-            // Issue #5 fix: If the user backs out while paused (or never started playing),
-            // explicitly stop the started service so it doesn't linger.
+            // If the user backs out while paused, stop the started service so it doesn't linger.
             val isCurrentlyPlaying = readerService?.isPlayingFlow?.value ?: false
             if (!isCurrentlyPlaying) {
                 context.stopService(serviceIntent)
             }
 
-            // Release PDF resources (Issues #2 and #6)
+            // Release PDF resources
             pdfHelper.closeDocument()
             pdfHelper.closeRenderer()
         }
@@ -167,18 +177,24 @@ fun ReaderScreen(
     var isVisualMode by remember { mutableStateOf(true) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
+    // Pager state — pageCount lambda reacts to totalPages updates
+    val pagerState = rememberPagerState(initialPage = 0, pageCount = { totalPages })
+
     // OBSERVE SERVICE STATE
     val currentSentenceIndex by readerService?.currentSentenceIndexFlow?.collectAsState(initial = 0) ?: remember { mutableIntStateOf(0) }
     val isPlaying by readerService?.isPlayingFlow?.collectAsState(initial = false) ?: remember { mutableStateOf(false) }
 
     val textListState = rememberLazyListState()
 
-    // Restore saved page on first bind
+    // Fetch total page count and restore saved page on first bind
     LaunchedEffect(isBound) {
         if (isBound) {
             withContext(Dispatchers.IO) {
+                val count = PdfHelper.getPageCount(context, uri)
                 val saved = BookStore.getBook(context, uri.toString())
                 withContext(Dispatchers.Main) {
+                    // Set totalPages first so pagerState knows the valid range
+                    if (count > 0) totalPages = count
                     if (saved != null) currentPage = saved.currentPage
                 }
             }
@@ -226,6 +242,20 @@ fun ReaderScreen(
         }
     }
 
+    // Sync: user swipes pager → update currentPage state (triggers TTS + progress save)
+    LaunchedEffect(pagerState.currentPage) {
+        if (currentPage != pagerState.currentPage) {
+            currentPage = pagerState.currentPage
+        }
+    }
+
+    // Sync: currentPage changed by buttons / TTS auto-advance → scroll pager to match
+    LaunchedEffect(currentPage) {
+        if (pagerState.currentPage != currentPage) {
+            pagerState.scrollToPage(currentPage)
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // UI
     // ─────────────────────────────────────────────────────────────────────────
@@ -251,24 +281,37 @@ fun ReaderScreen(
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
 
-            // MAIN CONTENT
+            // MAIN CONTENT — windowed 3-page renderer (prev + current + next only)
             if (isVisualMode) {
-                AndroidView(
-                    factory = { ctx -> PDFView(ctx, null) },
-                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.75f).padding(bottom = 16.dp),
-                    update = { view ->
-                        view.fromUri(uri)
-                            .defaultPage(currentPage)
-                            .onPageChange { page, count ->
-                                if (currentPage != page) currentPage = page
-                                totalPages = count
-                            }
-                            .enableSwipe(true)
-                            .swipeHorizontal(false)
-                            .spacing(10)
-                            .load()
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.75f),
+                    beyondViewportPageCount = 1 // keep 1 page pre-rendered in each direction
+                ) { pageIndex ->
+                    // Render this page's bitmap lazily on the IO thread
+                    val bitmap by produceState<Bitmap?>(initialValue = null, pageIndex, uri) {
+                        value = withContext(Dispatchers.IO) {
+                            PdfHelper.renderPageToBitmap(context, uri, pageIndex)
+                        }
                     }
-                )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(bottom = 16.dp, start = 8.dp, end = 8.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (bitmap != null) {
+                            Image(
+                                bitmap = bitmap!!.asImageBitmap(),
+                                contentDescription = "Page ${pageIndex + 1}",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+                        } else {
+                            CircularProgressIndicator(color = AccentBlue)
+                        }
+                    }
+                }
             } else {
                 LazyColumn(
                     state = textListState,

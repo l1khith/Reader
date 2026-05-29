@@ -132,6 +132,7 @@ object PdfHelper {
      * @param pageIndex 0-based index of the page to read.
      * @return A list of clean, speakable sentences.
      */
+    @Synchronized
     fun extractTextFromPage(context: Context, uri: Uri, pageIndex: Int): List<String> {
         try {
             // Ensure document is cached; use it if available
@@ -167,6 +168,7 @@ object PdfHelper {
      *
      * @return A Bitmap of the page, or null if rendering failed.
      */
+    @Synchronized
     fun renderPageToBitmap(context: Context, uri: Uri, pageIndex: Int): Bitmap? {
         val renderer = cachedRenderer?.takeIf { cachedRendererUri == uri }
             ?: run {
@@ -181,8 +183,21 @@ object PdfHelper {
         var currentPage: PdfRenderer.Page? = null
         return try {
             currentPage = renderer.openPage(pageIndex)
-            val bitmap = createBitmap(currentPage.width, currentPage.height)
-            currentPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+            // Render at 2× the PDF's native point size for crisp text on high-DPI screens
+            val scale = 2
+            val bitmapWidth  = currentPage.width  * scale
+            val bitmapHeight = currentPage.height * scale
+            val bitmap = createBitmap(bitmapWidth, bitmapHeight)
+
+            // Fill white: PdfRenderer writes transparent pixels where the PDF background is
+            // unset, which appear black on a dark surface without this.
+            bitmap.eraseColor(android.graphics.Color.WHITE)
+
+            val matrix = android.graphics.Matrix().apply {
+                setScale(scale.toFloat(), scale.toFloat())
+            }
+            currentPage.render(bitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
             bitmap
         } catch (e: Exception) {
             Log.e(TAG, "Error rendering page: ${e.message}")
