@@ -3,9 +3,11 @@ package com.example.reader
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
+import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.support.v4.media.session.MediaSessionCompat
@@ -23,6 +25,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
     private val binder = LocalBinder()
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
+
+    // PARTIAL_WAKE_LOCK: keeps CPU alive during TTS when screen is off (Doze Mode fix)
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private var sentences: List<String> = emptyList()
     private var currentSentenceIndex = 0
@@ -43,6 +48,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         tts = TextToSpeech(this, this)
         setupMediaSession()
         createNotificationChannel()
+        // Acquire WakeLock reference (not held yet — only acquired during active playback)
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReaderApp::TTSPlayLock")
     }
 
     private fun setupMediaSession() {
@@ -141,6 +149,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         _isPlayingFlow.value = false
         updateMediaState(PlaybackStateCompat.STATE_PAUSED)
 
+        // Release WakeLock — CPU can sleep again when not playing
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+
         // Update notification to show pause state, then detach from foreground
         updateForegroundNotification()
         stopForeground(STOP_FOREGROUND_DETACH)
@@ -152,6 +163,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
      */
     fun resumeAudio() {
         _isPlayingFlow.value = true
+        // Acquire WakeLock: CPU stays awake while screen is off during TTS playback
+        // 10-minute safety timeout prevents permanent lock if app crashes
+        if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 60 * 1000L)
         updateMediaState(PlaybackStateCompat.STATE_PLAYING)
         updateForegroundNotification()
         speakCurrentSentence()
@@ -240,10 +254,17 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        androidx.media.session.MediaButtonReceiver.handleIntent(mediaSession, intent)
+        return START_STICKY
+    }
+
     override fun onDestroy() {
         tts?.stop()
         tts?.shutdown()
         mediaSession.release()
+        // Always release the WakeLock on destroy to prevent OS-level battery leak
+        if (wakeLock?.isHeld == true) wakeLock?.release()
         super.onDestroy()
     }
 

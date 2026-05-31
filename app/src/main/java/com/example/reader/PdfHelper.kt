@@ -6,6 +6,25 @@ import android.net.Uri
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+/**
+ * Lightweight wrapper around a pool Bitmap.
+ *
+ * WHY THIS EXISTS — The Compose State Equality Trap:
+ * `produceState` only triggers a UI redraw when `value` changes to a NEW object reference.
+ * Because the Bitmap pool reuses the same 3 Bitmap instances, returning the bare Bitmap
+ * means Compose sees "same reference as before" and skips the redraw — page 4 would
+ * silently display page 1's content.
+ *
+ * Wrapping in a data class with a monotonic [updateTrigger] guarantees a new object on
+ * every render call, forcing Compose to notice the change and redraw.
+ */
+data class PageRender(
+    val bitmap: Bitmap,
+    val updateTrigger: Long = System.nanoTime()
+)
 
 /**
  * PdfHelper — stateful singleton wrapper around [NativePdfEngine] (Pdfium JNI).
@@ -32,8 +51,19 @@ import android.view.WindowManager
  *
  * THREAD SAFETY
  * ─────────────
- * All public functions that touch [docPtr] or the pool are @Synchronized.
- * Pdfium's FPDF_Document is not thread-safe, so we serialize all calls.
+ * All public functions that touch [docPtr] or the pool are protected by a
+ * Kotlin Coroutine [Mutex] via [mutex.withLock].
+ *
+ * WHY MUTEX OVER @Synchronized:
+ * `@Synchronized` physically BLOCKS the underlying OS thread while waiting
+ * for the lock. Under heavy paging (10 fast swipes = 10 concurrent render
+ * coroutines), this starves Android's Dispatchers.IO thread pool, causing
+ * audio stuttering and UI frame drops.
+ *
+ * `Mutex.withLock` SUSPENDS the coroutine instead of blocking the thread,
+ * freeing the IO thread to handle TTS or DB work while it waits. The
+ * Pdfium FPDF_Document is still fully serialised — only one caller touches
+ * it at a time — but no OS threads are wasted in the queue.
  */
 object PdfHelper {
 
@@ -42,6 +72,10 @@ object PdfHelper {
     // ── Pdfium document handle (0 = closed) ──────────────────────────────
     private var docPtr: Long = 0L
     private var cachedUri: Uri? = null
+
+    // ── Coroutine Mutex: suspends (not blocks) coroutines waiting for the lock.
+    // All Pdfium C++ calls are serialised through this single mutex.
+    private val pdfMutex = Mutex()
 
     // ── Bitmap pool: exactly 3 slots for the pager's 3-page window ───────
     private val bitmapPool: Array<Bitmap?> = arrayOfNulls(3)
@@ -60,44 +94,40 @@ object PdfHelper {
      *
      * Must be called from the IO dispatcher (heavy mmap work inside JNI).
      * Replaces the old openDocument() + openRenderer() dual-call.
+     *
+     * Uses [pdfMutex] to suspend (not block) if another coroutine is already
+     * inside a Pdfium call.
      */
-    @Synchronized
-    fun openDocument(context: Context, uri: Uri) {
-        if (cachedUri == uri && docPtr != 0L) return   // already open
+    suspend fun openDocument(context: Context, uri: Uri) {
+        pdfMutex.withLock {
+            if (cachedUri == uri && docPtr != 0L) return@withLock   // already open
 
-        closeAll()
-        resolveTargetSize(context)
+            closeAll()
+            resolveTargetSize(context)
 
-        try {
-            val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: run {
-                Log.e(TAG, "openDocument: contentResolver returned null for $uri")
-                return
+            try {
+                val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: run {
+                    Log.e(TAG, "openDocument: contentResolver returned null for $uri")
+                    return@withLock
+                }
+                // Pass the raw int fd to JNI — the C++ layer memory-maps the file,
+                // so the ParcelFileDescriptor can be closed immediately afterward.
+                val rawFd = pfd.fd
+                docPtr = NativePdfEngine.loadDocument(rawFd)
+                pfd.close()   // safe; the mmap outlives the fd
+
+                if (docPtr == 0L) {
+                    Log.e(TAG, "openDocument: Pdfium failed to load $uri")
+                    return@withLock
+                }
+                cachedUri = uri
+                Log.d(TAG, "openDocument: success — ${NativePdfEngine.getPageCount(docPtr)} pages")
+            } catch (e: Exception) {
+                Log.e(TAG, "openDocument: ${e.message}")
             }
-            // Pass the raw int fd to JNI — the C++ layer memory-maps the file,
-            // so the ParcelFileDescriptor can be closed immediately afterward.
-            val rawFd = pfd.fd
-            docPtr = NativePdfEngine.loadDocument(rawFd)
-            pfd.close()   // safe; the mmap outlives the fd
-
-            if (docPtr == 0L) {
-                Log.e(TAG, "openDocument: Pdfium failed to load $uri")
-                return
-            }
-            cachedUri = uri
-            Log.d(TAG, "openDocument: success — ${NativePdfEngine.getPageCount(docPtr)} pages")
-        } catch (e: Exception) {
-            Log.e(TAG, "openDocument: ${e.message}")
         }
     }
 
-    /**
-     * No-op — kept so [ReaderScreen]'s LaunchedEffect needs no changes.
-     * Pdfium handles both rendering and text extraction in one engine.
-     */
-    fun openRenderer(context: Context, uri: Uri) = Unit
-
-    fun closeDocument() = closeAll()
-    fun closeRenderer() = Unit   // no-op — single engine
 
     private fun closeAll() {
         if (docPtr != 0L) {
@@ -109,59 +139,65 @@ object PdfHelper {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Public API  (surface identical to the old PdfHelper — ReaderScreen
-    //              requires zero changes)
+    // Public API
     // ─────────────────────────────────────────────────────────────────────
 
     /** Returns the total page count, or 0 if no document is open. */
-    @Synchronized
-    fun getPageCount(context: Context, uri: Uri): Int {
-        if (docPtr == 0L) return 0
-        return NativePdfEngine.getPageCount(docPtr)
+    suspend fun getPageCount(context: Context, uri: Uri): Int {
+        return pdfMutex.withLock {
+            if (docPtr == 0L) 0 else NativePdfEngine.getPageCount(docPtr)
+        }
     }
 
     /**
-     * Renders [pageIndex] into a pool Bitmap and returns it.
+     * Renders [pageIndex] into a pool Bitmap and returns a [PageRender] wrapper.
+     *
+     * The wrapper guarantees a new object reference on every call, which is required
+     * to satisfy Compose's structural equality check inside `produceState`.
+     * See [PageRender] for the full explanation.
      *
      * Pool slot selection: `pageIndex % 3`.
      * The pager's 3-page window guarantees no slot conflict — see class KDoc.
      *
-     * The C++ layer renders directly into the Bitmap's pixel buffer (zero copy).
-     * The returned Bitmap is the pool Bitmap itself; the caller must NOT recycle it.
+     * Suspends (not blocks) on the Mutex if another Pdfium call is in flight.
      */
-    @Synchronized
-    fun renderPageToBitmap(context: Context, uri: Uri, pageIndex: Int): Bitmap? {
-        if (docPtr == 0L) {
-            Log.w(TAG, "renderPageToBitmap: no document open")
-            return null
-        }
+    suspend fun renderPageToBitmap(context: Context, uri: Uri, pageIndex: Int): PageRender? {
+        return pdfMutex.withLock {
+            if (docPtr == 0L) {
+                Log.w(TAG, "renderPageToBitmap: no document open")
+                return@withLock null
+            }
 
-        val slot   = pageIndex % 3
-        val bitmap = ensurePoolBitmap(slot)
+            val slot   = pageIndex % 3
+            val bitmap = ensurePoolBitmap(slot)
 
-        return if (NativePdfEngine.renderPage(docPtr, pageIndex, bitmap)) {
-            bitmap
-        } else {
-            Log.e(TAG, "renderPage failed for page $pageIndex")
-            null
+            if (NativePdfEngine.renderPage(docPtr, pageIndex, bitmap)) {
+                PageRender(bitmap)   // new wrapper = new reference = Compose redraws✓
+            } else {
+                Log.e(TAG, "renderPage failed for page $pageIndex")
+                null
+            }
         }
     }
 
     /**
      * Extracts text from [pageIndex] via Pdfium and tokenises it into sentences.
      * Replaces the old PDFBox-based implementation — same return type.
+     *
+     * Suspends (not blocks) on the Mutex if another Pdfium call is in flight.
      */
-    @Synchronized
-    fun extractTextFromPage(context: Context, uri: Uri, pageIndex: Int): List<String> {
-        if (docPtr == 0L) return listOf("Error: document not open.")
-        return try {
-            val raw = NativePdfEngine.extractText(docPtr, pageIndex)
-            raw.split(Regex("(?<=[.!?])\\s+"))
-               .map    { it.trim() }
-               .filter { it.isNotBlank() }
-        } catch (e: Exception) {
-            Log.e(TAG, "extractTextFromPage error: ${e.message}")
-            listOf("Error reading page.")
+    suspend fun extractTextFromPage(context: Context, uri: Uri, pageIndex: Int): List<String> {
+        return pdfMutex.withLock {
+            if (docPtr == 0L) return@withLock listOf("Error: document not open.")
+            try {
+                val raw = NativePdfEngine.extractText(docPtr, pageIndex)
+                raw.split(Regex("(?<=[.!?])\\s+"))
+                   .map    { it.trim() }
+                   .filter { it.isNotBlank() }
+            } catch (e: Exception) {
+                Log.e(TAG, "extractTextFromPage error: ${e.message}")
+                listOf("Error reading page.")
+            }
         }
     }
 

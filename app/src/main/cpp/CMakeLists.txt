@@ -26,13 +26,20 @@ target_include_directories(pdfium_bridge PRIVATE
 # System libraries
 find_library(log-lib      log)        # __android_log_print
 find_library(jnigraphics  jnigraphics) # AndroidBitmap_lockPixels
-find_library(android-lib  android)    # Android NDK utilities
 
 target_link_libraries(pdfium_bridge
     pdfium          # pre-built Pdfium
     ${jnigraphics}  # direct Bitmap pixel access
     ${log-lib}
-    ${android-lib}
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16 KB page-size alignment  (required by Google Play for Android 15+ devices)
+# Aligns LOAD segments in libpdfium_bridge.so at 16 384-byte boundaries.
+# https://developer.android.com/guide/practices/page-sizes
+# ─────────────────────────────────────────────────────────────────────────────
+target_link_options(pdfium_bridge PRIVATE
+    "LINKER:-z,max-page-size=16384"
 )
 
 # Use the shared C++ STL so Pdfium and our bridge share one runtime

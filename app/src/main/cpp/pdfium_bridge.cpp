@@ -26,7 +26,6 @@
 #include <string>
 #include <vector>
 #include <algorithm>   // std::min
-#include <cmath>
 
 // Pdfium public headers (placed in app/src/main/cpp/include/ by the developer)
 #include "fpdfview.h"

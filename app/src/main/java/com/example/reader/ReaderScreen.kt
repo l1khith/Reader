@@ -57,7 +57,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -71,6 +70,8 @@ import com.example.reader.ui.theme.SurfaceDark
 import com.example.reader.ui.theme.TextGrey
 import com.example.reader.ui.theme.TextWhite
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 @Composable
@@ -134,7 +135,6 @@ fun ReaderScreen(
     LaunchedEffect(uri) {
         withContext(Dispatchers.IO) {
             pdfHelper.openDocument(context, uri)
-            pdfHelper.openRenderer(context, uri)
         }
     }
 
@@ -155,9 +155,9 @@ fun ReaderScreen(
                 context.stopService(serviceIntent)
             }
 
-            // Release PDF resources
-            pdfHelper.closeDocument()
-            pdfHelper.closeRenderer()
+            // NOTE: pdfHelper.closeDocument() / closeRenderer() are intentionally NOT called here.
+            // Native PDF state lives in the ViewModel and survives configuration changes (rotation,
+            // dark/light mode toggle). The ViewModel.onCleared() handles final teardown.
         }
     }
 
@@ -165,13 +165,7 @@ fun ReaderScreen(
     // STATES
     // ─────────────────────────────────────────────────────────────────────────
 
-    val initialPage = remember {
-        val savedBooks = BookStore.getAllBooksFlow(context)
-        // Can't suspend here; use page 0 as default, the LaunchedEffect below will restore
-        0
-    }
-
-    var currentPage by remember { mutableIntStateOf(initialPage) }
+    var currentPage by remember { mutableIntStateOf(0) }
     var sentences by remember { mutableStateOf<List<String>>(emptyList()) }
     var totalPages by remember { mutableIntStateOf(1) }
     var isVisualMode by remember { mutableStateOf(true) }
@@ -217,13 +211,15 @@ fun ReaderScreen(
         }
     }
 
+    // Cache filename once to avoid ContentResolver disk I/O on every page flip
+    val cachedFileName = remember(uri) { FileNameUtils.getFileName(context, uri) }
+
     // Sync page content & save progress
     LaunchedEffect(currentPage, uri, isBound) {
         if (!isBound) return@LaunchedEffect
 
-        // Save progress (now async O(1) via Room — Issue #4)
-        val fileName = FileNameUtils.getFileName(context, uri)
-        BookStore.saveBookProgress(context, uri, currentPage, totalPages, fileName)
+        // Save progress using the cached filename — no disk read per page swipe
+        BookStore.saveBookProgress(context, uri, currentPage, totalPages, cachedFileName)
 
         // Extract text using cached PDDocument (Issue #2)
         withContext(Dispatchers.IO) {
@@ -288,8 +284,15 @@ fun ReaderScreen(
                     modifier = Modifier.fillMaxWidth().fillMaxHeight(0.75f),
                     beyondViewportPageCount = 1 // keep 1 page pre-rendered in each direction
                 ) { pageIndex ->
-                    // Render this page's bitmap lazily on the IO thread
-                    val bitmap by produceState<Bitmap?>(initialValue = null, pageIndex, uri) {
+                    // Render this page's bitmap lazily on the IO thread.
+                    // Returns a PageRender wrapper — NOT a raw Bitmap — so Compose's
+                    // structural equality check always sees a new object and redraws.
+                    // (Same Bitmap reference → skipped redraw → page 4 shows page 1's content)
+                    val pageRender by produceState<PageRender?>(initialValue = null, pageIndex, uri) {
+                        // DEBOUNCE: If user swipes past faster than 150ms, cancel before
+                        // hitting the heavy synchronous JNI render call.
+                        delay(150)
+                        ensureActive()
                         value = withContext(Dispatchers.IO) {
                             PdfHelper.renderPageToBitmap(context, uri, pageIndex)
                         }
@@ -300,9 +303,9 @@ fun ReaderScreen(
                             .padding(bottom = 16.dp, start = 8.dp, end = 8.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        if (bitmap != null) {
+                        if (pageRender != null) {
                             Image(
-                                bitmap = bitmap!!.asImageBitmap(),
+                                bitmap = pageRender!!.bitmap.asImageBitmap(),
                                 contentDescription = "Page ${pageIndex + 1}",
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Fit
