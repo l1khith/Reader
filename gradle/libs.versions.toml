@@ -11,12 +11,8 @@ kotlin = "2.0.21"
 composeBom = "2024.04.01"
 materialIconsExtended = "1.6.3"
 navigationCompose = "2.7.7"
-pdfbox = "2.0.27.0"
-foundation = "1.10.2"
-foundationLayout = "1.10.2"
 material3 = "1.4.0"
 gson = "2.10.1"
-androidPdfViewer = "3.2.0-beta.3"
 room = "2.7.0"
 ksp = "2.0.21-1.0.28"
 
@@ -38,12 +34,10 @@ androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "u
 androidx-compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
 androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
-pdfbox-android = { group = "com.tom-roush", name = "pdfbox-android", version.ref = "pdfbox" }
 androidx-compose-foundation = { group = "androidx.compose.foundation", name = "foundation" }
 androidx-compose-foundation-layout = { group = "androidx.compose.foundation", name = "foundation-layout" }
 androidx-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "material3" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
-android-pdf-viewer = { module = "com.github.mhiew:android-pdf-viewer", version.ref = "androidPdfViewer" }
 androidx-media = { module = "androidx.media:media", version = "1.7.0" }
 androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
 androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
