@@ -88,7 +88,6 @@ fun AppNavigation() {
 
                 ReaderScreen(
                     uri = uri,
-                    pdfHelper = PdfHelper,
                     onBack = {
                         navController.popBackStack()
                     }
