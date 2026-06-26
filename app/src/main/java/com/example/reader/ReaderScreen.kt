@@ -94,7 +94,6 @@ fun ToggleButton(text: String, isSelected: Boolean, onClick: () -> Unit) {
 @Composable
 fun ReaderScreen(
     uri: Uri,
-    pdfHelper: PdfHelper,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -129,14 +128,6 @@ fun ReaderScreen(
     // in onDispose. We also stop the service if the user exits while paused
     // (Issue #5) to prevent the service from lingering indefinitely.
     // ─────────────────────────────────────────────────────────────────────────
-
-    // Open heavy PDF resources on the IO thread so the main thread is never blocked
-    // (PDDocument.load reads the entire PDF structure — can take seconds on large files)
-    LaunchedEffect(uri) {
-        withContext(Dispatchers.IO) {
-            pdfHelper.openDocument(context, uri)
-        }
-    }
 
     DisposableEffect(uri) {
         // Start and bind service (fast — main thread is fine here)
@@ -184,11 +175,10 @@ fun ReaderScreen(
     LaunchedEffect(isBound) {
         if (isBound) {
             withContext(Dispatchers.IO) {
-                val count = PdfHelper.getPageCount(context, uri)
-                val saved = BookStore.getBook(context, uri.toString())
+                val result = PdfHelper.openDocument(context, uri)
+                val saved  = BookStore.getBook(context, uri.toString())
                 withContext(Dispatchers.Main) {
-                    // Set totalPages first so pagerState knows the valid range
-                    if (count > 0) totalPages = count
+                    if (result is PdfResult.Success && result.value > 0) totalPages = result.value
                     if (saved != null) currentPage = saved.currentPage
                 }
             }
@@ -218,15 +208,18 @@ fun ReaderScreen(
     LaunchedEffect(currentPage, uri, isBound) {
         if (!isBound) return@LaunchedEffect
 
-        // Save progress using the cached filename — no disk read per page swipe
         BookStore.saveBookProgress(context, uri, currentPage, totalPages, cachedFileName)
 
-        // Extract text using cached PDDocument (Issue #2)
         withContext(Dispatchers.IO) {
-            val extractedSentences = pdfHelper.extractTextFromPage(context, uri, currentPage)
+            val result = PdfHelper.extractTextFromPage(context, uri, currentPage)
+            val extracted = when (result) {
+                is PdfResult.Success -> result.value
+                is PdfResult.Error   -> emptyList()
+                is PdfResult.NotReady -> emptyList()
+            }
             withContext(Dispatchers.Main) {
-                sentences = extractedSentences
-                readerService?.setSentences(extractedSentences)
+                sentences = extracted
+                readerService?.setSentences(extracted)
             }
         }
     }
@@ -289,13 +282,12 @@ fun ReaderScreen(
                     // structural equality check always sees a new object and redraws.
                     // (Same Bitmap reference → skipped redraw → page 4 shows page 1's content)
                     val pageRender by produceState<PageRender?>(initialValue = null, pageIndex, uri) {
-                        // DEBOUNCE: If user swipes past faster than 150ms, cancel before
-                        // hitting the heavy synchronous JNI render call.
                         delay(150)
                         ensureActive()
-                        value = withContext(Dispatchers.IO) {
+                        val result = withContext(Dispatchers.IO) {
                             PdfHelper.renderPageToBitmap(context, uri, pageIndex)
                         }
+                        value = if (result is PdfResult.Success) result.value else null
                     }
                     Box(
                         modifier = Modifier
