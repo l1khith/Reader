@@ -15,6 +15,8 @@ import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -25,6 +27,12 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
     private val binder = LocalBinder()
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
+
+    // Single service-level scope tied to onDestroy.
+    // Replaces the previous pattern of CoroutineScope(Dispatchers.Main).launch
+    // called per-sentence, which created thousands of abandoned scopes during a
+    // reading session and was never cancelled.
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // PARTIAL_WAKE_LOCK: keeps CPU alive during TTS when screen is off (Doze Mode fix)
     private var wakeLock: PowerManager.WakeLock? = null
@@ -43,12 +51,23 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
 
     private lateinit var mediaSession: MediaSessionCompat
 
+    // Single UtteranceProgressListener instance registered ONCE in onInit.
+    // The previous code re-registered a new anonymous object on every sentence,
+    // which allocated garbage and could deliver callbacks to a stale listener.
+    private val utteranceListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String?) {}
+        override fun onDone(utteranceId: String?) {
+            serviceScope.launch { nextSentence() }
+        }
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String?) {}
+    }
+
     override fun onCreate() {
         super.onCreate()
         tts = TextToSpeech(this, this)
         setupMediaSession()
         createNotificationChannel()
-        // Acquire WakeLock reference (not held yet — only acquired during active playback)
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReaderApp::TTSPlayLock")
     }
@@ -69,7 +88,6 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             val result = tts?.setLanguage(Locale.US)
 
-            // SMART VOICE HUNTER
             if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
                 val voices = tts?.voices
                 if (voices != null) {
@@ -82,6 +100,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
                     if (bestVoice != null) tts?.voice = bestVoice
                 }
             }
+
+            // Register the listener once here, not on every sentence.
+            tts?.setOnUtteranceProgressListener(utteranceListener)
             isTtsReady = true
         }
     }
@@ -90,27 +111,17 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         if (isTtsReady) tts?.setSpeechRate(speed)
     }
 
-    /**
-     * Called when a new page is loaded.
-     *
-     * NOTIFICATION FIX (Issue #3): The notification is updated here (at page boundary) rather
-     * than inside [playSentence], which would fire on every single sentence.
-     */
     fun setSentences(newSentences: List<String>) {
         sentences = newSentences
         currentSentenceIndex = 0
         _currentSentenceIndexFlow.value = 0
 
         if (_isPlayingFlow.value && sentences.isNotEmpty()) {
-            // Update the notification once for the new page, then begin speaking
             updateForegroundNotification()
             speakCurrentSentence()
         }
     }
 
-    /**
-     * Internal TTS speaker. Does NOT touch the notification — that is done only at play/pause/page boundaries.
-     */
     private fun speakCurrentSentence() {
         val index = currentSentenceIndex
         if (!isTtsReady || index !in sentences.indices) return
@@ -118,24 +129,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         val params = android.os.Bundle()
         params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "id_$index")
         tts?.speak(sentences[index], TextToSpeech.QUEUE_FLUSH, params, "id_$index")
-
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) {
-                CoroutineScope(Dispatchers.Main).launch { nextSentence() }
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {}
-        })
+        // No listener registration here — listener is set once in onInit.
     }
 
-    /**
-     * Begin playback from a specific sentence index.
-     *
-     * NOTIFICATION FIX (Issue #3): [updateForegroundNotification] is only called when the play
-     * state actually changes (i.e., when called from [resumeAudio]). Mid-page sentence
-     * advancement does NOT trigger a notification push.
-     */
     fun playSentence(index: Int) {
         if (!isTtsReady || index !in sentences.indices) return
         currentSentenceIndex = index
@@ -147,25 +143,26 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
     fun pauseAudio() {
         tts?.stop()
         _isPlayingFlow.value = false
+        mediaSession.isActive = false
         updateMediaState(PlaybackStateCompat.STATE_PAUSED)
 
         // Release WakeLock — CPU can sleep again when not playing
         if (wakeLock?.isHeld == true) wakeLock?.release()
 
-        // Update notification to show pause state, then detach from foreground
         updateForegroundNotification()
         stopForeground(STOP_FOREGROUND_DETACH)
     }
 
-    /**
-     * NOTIFICATION FIX (Issue #3): On resume, update the notification once to reflect the
-     * "Playing" state, then start speaking.
-     */
     fun resumeAudio() {
         _isPlayingFlow.value = true
-        // Acquire WakeLock: CPU stays awake while screen is off during TTS playback
-        // 10-minute safety timeout prevents permanent lock if app crashes
-        if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 60 * 1000L)
+        mediaSession.isActive = true
+
+        // WakeLock timeout: 4 hours covers the longest audiobook chapters.
+        // The previous 10-minute timeout caused Doze Mode to kill TTS mid-sentence
+        // on long reading sessions. The lock is always explicitly released in
+        // pauseAudio() and onDestroy(), so the timeout is only a safety net.
+        if (wakeLock?.isHeld == false) wakeLock?.acquire(4 * 60 * 60 * 1000L)
+
         updateMediaState(PlaybackStateCompat.STATE_PLAYING)
         updateForegroundNotification()
         speakCurrentSentence()
@@ -175,11 +172,9 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         if (currentSentenceIndex < sentences.size - 1) {
             currentSentenceIndex++
             _currentSentenceIndexFlow.value = currentSentenceIndex
-            // No notification update here — sentence-level progression is silent
             speakCurrentSentence()
         } else {
-            // End of page — notify UI to flip page
-            CoroutineScope(Dispatchers.Main).launch {
+            serviceScope.launch {
                 onPageEndReached?.invoke()
             }
         }
@@ -191,10 +186,6 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    /**
-     * Builds and posts the foreground notification.
-     * Called ONLY on: play, pause, resume, or new page — never per-sentence.
-     */
     private fun updateForegroundNotification() {
         val notification = NotificationCompat.Builder(this, "READER_CHANNEL")
             .setContentTitle("Reading Book")
@@ -262,9 +253,10 @@ class ReaderService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         tts?.stop()
         tts?.shutdown()
+        mediaSession.isActive = false
         mediaSession.release()
-        // Always release the WakeLock on destroy to prevent OS-level battery leak
         if (wakeLock?.isHeld == true) wakeLock?.release()
+        serviceScope.cancel()   // cancels all in-flight coroutines cleanly
         super.onDestroy()
     }
 

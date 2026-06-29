@@ -146,9 +146,9 @@ fun ReaderScreen(
                 context.stopService(serviceIntent)
             }
 
-            // NOTE: pdfHelper.closeDocument() / closeRenderer() are intentionally NOT called here.
-            // Native PDF state lives in the ViewModel and survives configuration changes (rotation,
-            // dark/light mode toggle). The ViewModel.onCleared() handles final teardown.
+            // NOTE: PdfHelper is a process-scoped singleton. Documents stay open
+            // across configuration changes (rotation, dark mode). closeAllUnlocked()
+            // runs automatically when the next document is opened, or the process exits.
         }
     }
 
@@ -211,7 +211,7 @@ fun ReaderScreen(
         BookStore.saveBookProgress(context, uri, currentPage, totalPages, cachedFileName)
 
         withContext(Dispatchers.IO) {
-            val result = PdfHelper.extractTextFromPage(context, uri, currentPage)
+            val result = PdfHelper.extractTextFromPage(currentPage)
             val extracted = when (result) {
                 is PdfResult.Success -> result.value
                 is PdfResult.Error   -> emptyList()
@@ -285,7 +285,7 @@ fun ReaderScreen(
                         delay(150)
                         ensureActive()
                         val result = withContext(Dispatchers.IO) {
-                            PdfHelper.renderPageToBitmap(context, uri, pageIndex)
+                            PdfHelper.renderPageToBitmap(pageIndex)
                         }
                         value = if (result is PdfResult.Success) result.value else null
                     }

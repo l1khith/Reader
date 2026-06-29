@@ -2,11 +2,8 @@
 #include <android/bitmap.h>
 #include <android/log.h>
 
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <cstring>
-#include <string>
 #include <vector>
 #include <algorithm>   // std::min
 
@@ -15,7 +12,6 @@
 
 #define LOG_TAG "PdfiumBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 struct PdfDocument {
@@ -175,19 +171,68 @@ Java_com_example_reader_NativePdfEngine_extractText(
         return env->NewStringUTF("");
     }
 
+    // ── Geometry filter — Strategy 1 ─────────────────────────────────────
+    // PDF user-space coordinate system: Y=0 at page bottom, Y=pageHeight at top.
+    // We exclude the top 8% (running header) and bottom 8% (page number / footer).
+    //
+    //  pageHeight ──┐
+    //               │  [topExclusion = 0.92 × pageHeight]   ← header zone above this
+    //               │         SAFE BODY TEXT ZONE
+    //               │  [bottomExclusion = 0.08 × pageHeight] ← footer zone below this
+    //  0 ───────────┘
+    //
+    // A character is safe if and only if:
+    //   charTop    < topExclusion     (its top edge is below the header line)
+    //   charBottom > bottomExclusion  (its bottom edge is above the footer line)
+    //
+    // FPDFText_GetCharBox signature from fpdf_text.h (confirmed):
+    //   FPDFText_GetCharBox(text_page, index, &left, &right, &bottom, &top)
+    // ─────────────────────────────────────────────────────────────────────
+
+    const double pageHeight      = FPDF_GetPageHeight(page);
+    const double bottomExclusion = pageHeight * 0.08;
+    const double topExclusion    = pageHeight * 0.92;
+
     const int charCount = FPDFText_CountChars(textPage);
-    jstring result;
-    if (charCount <= 0) {
-        result = env->NewStringUTF("");
-    } else {
-        std::vector<unsigned short> buf(charCount + 1, 0);
-        FPDFText_GetText(textPage, 0, charCount, buf.data());
-        result = env->NewString(buf.data(), charCount);
+
+    // Reserve at charCount capacity; surrogate pairs can push past it but are rare.
+    std::vector<jchar> buf;
+    buf.reserve(static_cast<size_t>(charCount));
+
+    for (int i = 0; i < charCount; ++i) {
+        double left = 0, right = 0, bottom = 0, top = 0;
+
+        // If the bounding box query fails (generated whitespace/newline chars
+        // often have no box), include the character unconditionally so we
+        // don't silently drop spaces inside sentences.
+        const bool hasBox = FPDFText_GetCharBox(textPage, i, &left, &right, &bottom, &top)
+                            != 0;
+
+        if (hasBox) {
+            // Reject if the character touches the header or footer exclusion zones.
+            if (top >= topExclusion || bottom <= bottomExclusion) {
+                continue;
+            }
+        }
+
+        const unsigned int code = FPDFText_GetUnicode(textPage, i);
+        if (code == 0) continue;   // unmapped / null — skip
+
+        if (code < 0x10000u) {
+            buf.push_back(static_cast<jchar>(code));
+        } else {
+            // Encode as a UTF-16 surrogate pair (chars outside the BMP).
+            const unsigned int cp = code - 0x10000u;
+            buf.push_back(static_cast<jchar>(0xD800u | (cp >> 10)));
+            buf.push_back(static_cast<jchar>(0xDC00u | (cp & 0x3FFu)));
+        }
     }
 
     FPDFText_ClosePage(textPage);
     FPDF_ClosePage(page);
-    return result;
+
+    if (buf.empty()) return env->NewStringUTF("");
+    return env->NewString(buf.data(), static_cast<jsize>(buf.size()));
 }
 
 JNIEXPORT void JNICALL
